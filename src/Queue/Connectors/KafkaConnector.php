@@ -38,7 +38,8 @@ class KafkaConnector implements ConnectorInterface
     {
         /** @var Producer $producer */
         $producer = $this->container->makeWith('queue.kafka.producer', []);
-        $producer->addBrokers($config['brokers']);
+        // $producer->addBrokers($config['brokers']);
+        $producer->set('bootstrap.servers', $config['brokers']);
 
         /** @var TopicConf $topicConf */
         $topicConf = $this->container->makeWith('queue.kafka.topic_conf', []);
@@ -53,10 +54,11 @@ class KafkaConnector implements ConnectorInterface
             $conf->set('ssl.ca.location', $config['ssl_ca_location']);
         }
         $conf->set('group.id', array_get($config, 'consumer_group_id', 'php-pubsub'));
-        $conf->set('metadata.broker.list', $config['brokers']);
+        // $conf->set('metadata.broker.list', $config['brokers']);
+        $conf->set('bootstrap.servers', $config['brokers']);
         $conf->set('enable.auto.commit', 'false');
-        $conf->set('offset.store.method', 'broker');
-        $conf->setDefaultTopicConf($topicConf);
+        // $conf->set('offset.store.method', 'broker');
+        // $conf->setDefaultTopicConf($topicConf);
 
         /** @var KafkaConsumer $consumer */
         $consumer = $this->container->makeWith('queue.kafka.consumer', ['conf' => $conf]);
