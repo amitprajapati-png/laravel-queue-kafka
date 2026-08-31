@@ -36,32 +36,44 @@ class KafkaConnector implements ConnectorInterface
      */
     public function connect(array $config)
     {
-        /** @var Producer $producer */
-        $producer = $this->container->makeWith('queue.kafka.producer', []);
-        // $producer->addBrokers($config['brokers']);
-        $producer->set('bootstrap.servers', $config['brokers']);
+        /** @var Conf $producerConf */
+        $producerConf = $this->container->makeWith('queue.kafka.conf', []);
 
-        /** @var TopicConf $topicConf */
-        $topicConf = $this->container->makeWith('queue.kafka.topic_conf', []);
-        $topicConf->set('auto.offset.reset', 'largest');
+        $producerConf->set('bootstrap.servers', $config['brokers']);
 
-        /** @var Conf $conf */
-        $conf = $this->container->makeWith('queue.kafka.conf', []);
         if (true === $config['sasl_enable']) {
-            $conf->set('sasl.mechanisms', 'PLAIN');
-            $conf->set('sasl.username', $config['sasl_plain_username']);
-            $conf->set('sasl.password', $config['sasl_plain_password']);
-            $conf->set('ssl.ca.location', $config['ssl_ca_location']);
+            $producerConf->set('sasl.mechanisms', 'PLAIN');
+            $producerConf->set('sasl.username', $config['sasl_plain_username']);
+            $producerConf->set('sasl.password', $config['sasl_plain_password']);
+            $producerConf->set('ssl.ca.location', $config['ssl_ca_location']);
         }
-        $conf->set('group.id', array_get($config, 'consumer_group_id', 'php-pubsub'));
-        // $conf->set('metadata.broker.list', $config['brokers']);
-        $conf->set('bootstrap.servers', $config['brokers']);
-        $conf->set('enable.auto.commit', 'false');
-        // $conf->set('offset.store.method', 'broker');
-        // $conf->setDefaultTopicConf($topicConf);
 
-        /** @var KafkaConsumer $consumer */
-        $consumer = $this->container->makeWith('queue.kafka.consumer', ['conf' => $conf]);
+        $producer = new Producer($producerConf);
+
+
+        /** @var Conf $consumerConf */
+        $consumerConf = $this->container->makeWith('queue.kafka.conf', []);
+
+        $consumerConf->set(
+            'group.id',
+            array_get($config, 'consumer_group_id', 'php-pubsub')
+        );
+
+        $consumerConf->set('bootstrap.servers', $config['brokers']);
+        $consumerConf->set('enable.auto.commit', 'false');
+        $consumerConf->set('auto.offset.reset', 'latest');
+
+        if (true === $config['sasl_enable']) {
+            $consumerConf->set('sasl.mechanisms', 'PLAIN');
+            $consumerConf->set('sasl.username', $config['sasl_plain_username']);
+            $consumerConf->set('sasl.password', $config['sasl_plain_password']);
+            $consumerConf->set('ssl.ca.location', $config['ssl_ca_location']);
+        }
+
+        $consumer = $this->container->makeWith(
+            'queue.kafka.consumer',
+            ['conf' => $consumerConf]
+        );
 
         return new KafkaQueue(
             $producer,
