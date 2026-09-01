@@ -42,6 +42,10 @@ class KafkaConnector implements ConnectorInterface
         $producerConf->set('bootstrap.servers', $config['brokers']);
 
         if (true === $config['sasl_enable']) {
+            $producerConf->set(
+                'security.protocol',
+                $config['security_protocol']
+            );
             $producerConf->set('sasl.mechanisms', 'PLAIN');
             $producerConf->set('sasl.username', $config['sasl_plain_username']);
             $producerConf->set('sasl.password', $config['sasl_plain_password']);
@@ -64,6 +68,10 @@ class KafkaConnector implements ConnectorInterface
         $consumerConf->set('auto.offset.reset', 'latest');
 
         if (true === $config['sasl_enable']) {
+            $consumerConf->set(
+                'security.protocol',
+                $config['security_protocol']
+            );
             $consumerConf->set('sasl.mechanisms', 'PLAIN');
             $consumerConf->set('sasl.username', $config['sasl_plain_username']);
             $consumerConf->set('sasl.password', $config['sasl_plain_password']);
