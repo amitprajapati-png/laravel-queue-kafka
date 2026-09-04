@@ -379,19 +379,33 @@ class KafkaJob extends Job implements JobContract
      */
     protected function getJobNameFromPayload(array $payload)
     {
-        if (!isset($payload['job'])) {
-            return null;
+        /*
+         * Laravel provides the actual dispatched job class
+         * in data.commandName.
+         */
+        if (
+            isset($payload['data']['commandName']) &&
+            !empty($payload['data']['commandName'])
+        ) {
+            return $payload['data']['commandName'];
         }
-
-        try {
-            list($class, $method) = JobName::parse(
-                $payload['job']
-            );
-
-            return $class;
-        } catch (Exception $exception) {
-            return $payload['job'];
+    
+        /*
+         * Fallback for other types of queue payloads.
+         */
+        if (isset($payload['job'])) {
+            try {
+                list($class, $method) = JobName::parse(
+                    $payload['job']
+                );
+    
+                return $class;
+            } catch (Exception $exception) {
+                return $payload['job'];
+            }
         }
+    
+        return null;
     }
 
     /**
