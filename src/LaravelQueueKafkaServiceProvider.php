@@ -113,38 +113,16 @@ class LaravelQueueKafkaServiceProvider extends ServiceProvider
 
     protected function getPartition(KafkaJob $job)
     {
-        try {
-            $reflection = new \ReflectionClass($job);
+        $message = $job->getKafkaMessage();
 
-            $property = $reflection->getProperty('message');
-            $property->setAccessible(true);
-
-            $message = $property->getValue($job);
-
-            return isset($message->partition)
-                ? $message->partition
-                : null;
-        } catch (\Exception $exception) {
-            return null;
-        }
+        return isset($message->partition) ? $message->partition : null;
     }
 
     protected function getOffset(KafkaJob $job)
     {
-        try {
-            $reflection = new \ReflectionClass($job);
+        $message = $job->getKafkaMessage();
 
-            $property = $reflection->getProperty('message');
-            $property->setAccessible(true);
-
-            $message = $property->getValue($job);
-
-            return isset($message->offset)
-                ? $message->offset
-                : null;
-        } catch (\Exception $exception) {
-            return null;
-        }
+        return isset($message->offset) ? $message->offset : null;
     }
 
     public function provides()
