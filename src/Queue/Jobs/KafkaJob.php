@@ -11,6 +11,7 @@ use Illuminate\Queue\Jobs\JobName;
 use Illuminate\Support\Str;
 use Rapide\LaravelQueueKafka\Exceptions\QueueKafkaException;
 use Rapide\LaravelQueueKafka\Queue\KafkaQueue;
+use App\Services\KafkaJobLogger;
 use RdKafka\ConsumerTopic;
 use RdKafka\Message;
 
@@ -18,85 +19,191 @@ class KafkaJob extends Job implements JobContract
 {
     use DetectsDeadlocks;
 
-    /**
-     * @var KafkaQueue
-     */
     protected $connection;
-    /**
-     * @var KafkaQueue
-     */
+
     protected $queue;
-    /**
-     * @var Message
-     */
+
     protected $message;
 
-    /**
-     * @var ConsumerTopic
-     */
     protected $topic;
 
     /**
-     * KafkaJob constructor.
+     * Number of times this same KafkaJob object has executed.
      *
-     * @param Container $container
-     * @param KafkaQueue $connection
-     * @param Message $message
-     * @param string $connectionName
-     * @param string $queue
-     * @param ConsumerTopic $topic
+     * This is particularly important for deadlock retries because
+     * deadlock retry happens inside fire() without creating a new
+     * Kafka message.
      */
-    public function __construct(Container $container, KafkaQueue $connection, Message $message, $connectionName, $queue, ConsumerTopic $topic)
-    {
+    protected $executionAttempts = 0;
+
+    /**
+     * Last exception thrown by the job.
+     */
+    protected $lastException;
+
+    /**
+     * MongoDB logger.
+     */
+    protected $jobLogger;
+
+    public function __construct(
+        Container $container,
+        KafkaQueue $connection,
+        Message $message,
+        $connectionName,
+        $queue,
+        ConsumerTopic $topic
+    ) {
         $this->container = $container;
+
         $this->connection = $connection;
+
         $this->message = $message;
+
         $this->connectionName = $connectionName;
+
         $this->queue = $queue;
+
         $this->topic = $topic;
+
+        $this->jobLogger = $container->make(
+            KafkaJobLogger::class
+        );
     }
 
     /**
-     * Fire the job.
-     *
-     * @throws Exception
+     * Execute the Kafka job.
      */
     public function fire()
     {
-        try {
-            $payload = $this->payload();
-            list($class, $method) = JobName::parse($payload['job']);
+        $payload = $this->payload();
 
-            with($this->instance = $this->resolve($class))->{$method}($this, $payload['data']);
+        /*
+         * Calculate current attempt.
+         */
+        $this->executionAttempts++;
+
+        $attempt = max(
+            $this->attempts(),
+            $this->executionAttempts
+        );
+
+        /*
+         * Store JOB_PROCESSING.
+         */
+        $this->jobLogger->processing(
+            $this->getJobId(),
+            [
+                'job_name' => $this->getJobNameFromPayload($payload),
+                'queue' => $this->getQueue(),
+                'connection' => $this->connectionName,
+                'attempt' => $attempt,
+                'partition' => $this->message->partition,
+                'offset' => $this->message->offset,
+            ]
+        );
+
+        try {
+            list($class, $method) = JobName::parse(
+                $payload['job']
+            );
+
+            with(
+                $this->instance = $this->resolve($class)
+            )->{$method}(
+                $this,
+                $payload['data']
+            );
+
+            /*
+             * If the job itself called release(), then it is not
+             * considered completed.
+             */
+            if (
+                method_exists($this, 'isReleased') &&
+                $this->isReleased()
+            ) {
+                return;
+            }
+
+            /*
+             * Job code completed successfully.
+             */
+            $this->jobLogger->completed(
+                $this->getJobId(),
+                [
+                    'job_name' => $this->getJobNameFromPayload($payload),
+                    'queue' => $this->getQueue(),
+                    'connection' => $this->connectionName,
+                    'attempt' => $attempt,
+                    'partition' => $this->message->partition,
+                    'offset' => $this->message->offset,
+                ]
+            );
         } catch (Exception $exception) {
+
+            $this->lastException = $exception;
+
+            /*
+             * Deadlock handling.
+             *
+             * This retry happens inside the same Kafka message.
+             */
             if (
                 $this->causedByDeadlock($exception) ||
-                Str::contains($exception->getMessage(), ['detected deadlock'])
+                Str::contains(
+                    $exception->getMessage(),
+                    ['detected deadlock']
+                )
             ) {
-                sleep($this->connection->getConfig()['sleep_on_deadlock']);
+                $this->jobLogger->retrying(
+                    $this->getJobId(),
+                    [
+                        'job_name' => $this->getJobNameFromPayload($payload),
+                        'queue' => $this->getQueue(),
+                        'connection' => $this->connectionName,
+                        'attempt' => $attempt,
+                        'reason' => 'deadlock',
+                        'error' => $exception->getMessage(),
+                    ]
+                );
+
+                sleep(
+                    $this->connection
+                        ->getConfig()['sleep_on_deadlock']
+                );
+
                 $this->fire();
 
                 return;
             }
 
+            /*
+             * Do NOT store JOB_FAILED here.
+             *
+             * Laravel may retry the job. The final JOB_FAILED event
+             * is recorded by the Laravel JobFailed event listener.
+             */
             throw $exception;
         }
     }
 
     /**
-     * Get the number of times the job has been attempted.
-     *
-     * @return int
+     * Return the current attempt number.
      */
     public function attempts()
     {
-        return (int) ($this->payload()['attempts']) + 1;
+        $payload = $this->payload();
+
+        return (
+            isset($payload['attempts'])
+                ? (int) $payload['attempts']
+                : 0
+        ) + 1;
     }
 
     /**
-     * Get the raw body string for the job.
-     *
-     * @return string
+     * Get raw Kafka message body.
      */
     public function getRawBody()
     {
@@ -104,65 +211,156 @@ class KafkaJob extends Job implements JobContract
     }
 
     /**
-     * Delete the job from the queue.
+     * Acknowledge/delete Kafka message.
      */
     public function delete()
     {
         try {
             parent::delete();
-            $this->topic->offsetStore($this->message->partition, $this->message->offset);
+
+            /*
+             * Store Kafka offset only after Laravel considers the
+             * message successfully deleted.
+             */
+            $this->topic->offsetStore(
+                $this->message->partition,
+                $this->message->offset
+            );
         } catch (\RdKafka\Exception $exception) {
-            throw new QueueKafkaException('Could not delete job from the queue', 0, $exception);
+            throw new QueueKafkaException(
+                'Could not delete job from the queue',
+                0,
+                $exception
+            );
         }
     }
 
     /**
-     * Release the job back into the queue.
-     *
-     * @param int $delay
-     *
-     * @throws Exception
+     * Release job for another attempt.
      */
     public function release($delay = 0)
     {
-        parent::release($delay);
+        /*
+         * Delayed jobs are still unsupported by this driver.
+         *
+         * Do this check BEFORE deleting the current Kafka message.
+         */
+        if ($delay > 0) {
+            throw new QueueKafkaException(
+                'Later not yet implemented'
+            );
+        }
 
-        $this->delete();
+        parent::release($delay);
 
         $body = $this->payload();
 
         /*
-         * Some jobs don't have the command set, so fall back to just sending it the job name string
+         * Current attempt.
          */
-        if (isset($body['data']['command']) === true) {
-            $job = $this->unserialize($body);
-        } else {
-            $job = $this->getName();
+        $attempt = max(
+            $this->attempts(),
+            $this->executionAttempts
+        );
+
+        /*
+         * Determine why this job is being released.
+         */
+        $reason = 'job_released';
+
+        $retryData = [
+            'job_name' => $this->getJobNameFromPayload($body),
+            'queue' => $this->getQueue(),
+            'connection' => $this->connectionName,
+            'attempt' => $attempt,
+            'reason' => $reason,
+        ];
+
+        if ($this->lastException instanceof Exception) {
+            $reason = 'exception_retry';
+
+            $retryData['reason'] = $reason;
+            $retryData['error'] = $this->lastException->getMessage();
+            $retryData['exception'] = get_class(
+                $this->lastException
+            );
         }
 
-        $data = $body['data'];
+        /*
+         * Store JOB_RETRYING before putting the next message.
+         */
+        $this->jobLogger->retrying(
+            $this->getJobId(),
+            $retryData
+        );
 
-        if ($delay > 0) {
-            $this->connection->later($delay, $job, $data, $this->getQueue());
-        } else {
-            $this->connection->push($job, $data, $this->getQueue());
-        }
+        /*
+         * Increment attempts in the Kafka payload.
+         *
+         * Original:
+         *
+         *     attempts = 0
+         *
+         * First retry:
+         *
+         *     attempts = 1
+         *
+         * Next processing:
+         *
+         *     attempts() = 2
+         */
+        $body['attempts'] = $attempt;
+
+        $payload = json_encode($body);
+
+        /*
+         * Produce the retry message FIRST.
+         *
+         * This is preferable to deleting the old message first because
+         * a Kafka produce failure should not cause job loss.
+         *
+         * The same ID is retained, so MongoDB continues tracking the
+         * same logical job.
+         */
+        $this->connection->pushRaw(
+            $payload,
+            $this->getQueue(),
+            [
+                'log_created' => false,
+            ]
+        );
+
+        /*
+         * Now acknowledge the old Kafka message.
+         */
+        $this->delete();
     }
 
     /**
-     * Get the job identifier.
-     *
-     * @return string
+     * Return Kafka job ID.
      */
     public function getJobId()
     {
-        return $this->message->key;
+        if (
+            isset($this->message->key) &&
+            $this->message->key !== null &&
+            $this->message->key !== ''
+        ) {
+            return $this->message->key;
+        }
+
+        /*
+         * Fallback to payload ID.
+         */
+        $payload = $this->payload();
+
+        return isset($payload['id'])
+            ? $payload['id']
+            : null;
     }
 
     /**
-     * Sets the job identifier.
-     *
-     * @param string $id
+     * Set Kafka job ID.
      */
     public function setJobId($id)
     {
@@ -170,24 +368,48 @@ class KafkaJob extends Job implements JobContract
     }
 
     /**
-     * Unserialize job.
+     * Get job class name from payload.
+     */
+    protected function getJobNameFromPayload(array $payload)
+    {
+        if (!isset($payload['job'])) {
+            return null;
+        }
+
+        try {
+            list($class, $method) = JobName::parse(
+                $payload['job']
+            );
+
+            return $class;
+        } catch (Exception $exception) {
+            return $payload['job'];
+        }
+    }
+
+    /**
+     * Unserialize command.
      *
-     * @param array $body
-     *
-     * @throws Exception
-     *
-     * @return mixed
+     * Kept for compatibility with the existing driver.
      */
     private function unserialize(array $body)
     {
         try {
-            return unserialize($body['data']['command']);
+            return unserialize(
+                $body['data']['command']
+            );
         } catch (Exception $exception) {
             if (
-                $this->causedByDeadlock($exception)
-                || Str::contains($exception->getMessage(), ['detected deadlock'])
+                $this->causedByDeadlock($exception) ||
+                Str::contains(
+                    $exception->getMessage(),
+                    ['detected deadlock']
+                )
             ) {
-                sleep($this->connection->getConfig()['sleep_on_deadlock']);
+                sleep(
+                    $this->connection
+                        ->getConfig()['sleep_on_deadlock']
+                );
 
                 return $this->unserialize($body);
             }
