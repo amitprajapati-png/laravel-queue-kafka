@@ -358,6 +358,13 @@ class KafkaJob extends Job implements JobContract
             ? $payload['id']
             : null;
     }
+    /**
+     * Get Kafka message.
+     */
+    public function getKafkaMessage()
+    {
+        return $this->message;
+    }
 
     /**
      * Set Kafka job ID.
