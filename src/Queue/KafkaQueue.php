@@ -150,23 +150,40 @@ class KafkaQueue extends Queue implements QueueContract
     protected function storeJobCreated($jobId, $payload, $queue)
     {
         try {
-            $jobName = isset($payload['job'])
-                ? $payload['job']
-                : null;
-
+            $jobName = null;
             $method = null;
-
-            if ($jobName) {
+    
+            /*
+             * Laravel stores the actual job class here.
+             *
+             * Example:
+             * App\Jobs\LoginHistoryJob
+             */
+            if (
+                isset($payload['data']['commandName']) &&
+                !empty($payload['data']['commandName'])
+            ) {
+                $jobName = $payload['data']['commandName'];
+    
+                /*
+                 * Laravel's queued job normally executes handle().
+                 */
+                $method = 'handle';
+            }
+    
+            /*
+             * Fallback for non-command jobs.
+             */
+            if (!$jobName && isset($payload['job'])) {
                 try {
-                    list($jobClass, $jobMethod) = JobName::parse($jobName);
-
-                    $jobName = $jobClass;
-                    $method = $jobMethod;
+                    list($jobName, $method) = JobName::parse(
+                        $payload['job']
+                    );
                 } catch (Exception $exception) {
-                    // Keep original job name if it cannot be parsed.
+                    $jobName = $payload['job'];
                 }
             }
-
+    
             $this->getJobLogger()->created(
                 $jobId,
                 [
