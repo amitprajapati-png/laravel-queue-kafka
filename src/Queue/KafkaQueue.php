@@ -6,59 +6,35 @@ use ErrorException;
 use Exception;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
+use Illuminate\Queue\Jobs\JobName;
 use Log;
 use Rapide\LaravelQueueKafka\Exceptions\QueueKafkaException;
 use Rapide\LaravelQueueKafka\Queue\Jobs\KafkaJob;
+use App\Services\KafkaJobLogger;
 
 class KafkaQueue extends Queue implements QueueContract
 {
-    /**
-     * @var string
-     */
     protected $defaultQueue;
 
-    /**
-     * @var int|bool
-     */
     protected $sleepOnError;
 
-    /**
-     * @var array
-     */
     protected $config;
 
-    /**
-     * @var string
-     */
     private $correlationId;
 
-    /**
-     * @var \RdKafka\Producer
-     */
     private $producer;
 
-    /**
-     * @var \RdKafka\Consumer
-     */
     private $consumer;
 
-    /**
-     * @var array
-     */
     private $topics = [];
 
-    /**
-     * @var array
-     */
     private $queues = [];
 
-    /**
-     * @param \RdKafka\Producer $producer
-     * @param \RdKafka\KafkaConsumer $consumer
-     * @param array $config
-     */
-    public function __construct(\RdKafka\Producer $producer, \RdKafka\Consumer $consumer, $config)
-    {
+    public function __construct(
+        \RdKafka\Producer $producer,
+        \RdKafka\Consumer $consumer,
+        $config
+    ) {
         $this->defaultQueue = $config['queue'];
 
         $this->sleepOnError = isset($config['sleep_on_error'])
@@ -66,73 +42,77 @@ class KafkaQueue extends Queue implements QueueContract
             : 5;
 
         $this->producer = $producer;
+
         $this->consumer = $consumer;
+
         $this->config = $config;
     }
 
-    /**
-     * Get the size of the queue.
-     *
-     * Kafka is an infinite queue, so the actual size cannot be returned.
-     *
-     * @param string $queue
-     *
-     * @return int
-     */
     public function size($queue = null)
     {
         return 1;
     }
 
     /**
-     * Push a new job onto the queue.
-     *
-     * @param string $job
-     * @param mixed $data
-     * @param string $queue
-     *
-     * @return bool|string
+     * Push a new job.
      */
     public function push($job, $data = '', $queue = null)
     {
         /*
-         * Generate a new ID for every new job.
-         *
-         * This is important because the queue object can be reused
-         * for multiple jobs.
+         * Every new logical job gets a new ID.
          */
         $this->correlationId = uniqid('', true);
 
         return $this->pushRaw(
             $this->createPayload($job, $queue, $data),
             $queue,
-            []
+            [
+                'log_created' => true,
+            ]
         );
     }
 
     /**
-     * Push a raw payload onto the queue.
-     *
-     * @param string $payload
-     * @param string $queue
-     * @param array $options
-     *
-     * @throws QueueKafkaException
-     *
-     * @return mixed
+     * Push raw payload to Kafka.
      */
     public function pushRaw($payload, $queue = null, array $options = [])
     {
         try {
-            $queueName = $this->getQueueName($queue);
-            $topic = $this->getTopic($queue);
-
-            $pushRawCorrelationId = $this->getCorrelationId();
+            $topicName = $this->getQueueName($queue);
 
             /*
-             * Produce the message first.
-             *
-             * Only log JOB_CREATED after Kafka accepts the message.
+             * Decode payload so that we can get the logical job ID.
+             */
+            $payloadData = json_decode($payload, true);
+
+            if (
+                is_array($payloadData) &&
+                isset($payloadData['id']) &&
+                $payloadData['id']
+            ) {
+                $pushRawCorrelationId = $payloadData['id'];
+
+                /*
+                 * Keep the same logical job ID when a job is retried.
+                 */
+                $this->correlationId = $pushRawCorrelationId;
+            } else {
+                $pushRawCorrelationId = $this->getCorrelationId();
+
+                if (
+                    is_array($payloadData) &&
+                    !isset($payloadData['id'])
+                ) {
+                    $payloadData['id'] = $pushRawCorrelationId;
+
+                    $payload = json_encode($payloadData);
+                }
+            }
+
+            $topic = $this->getTopic($queue);
+
+            /*
+             * Send the message to Kafka.
              */
             $topic->produce(
                 RD_KAFKA_PARTITION_UA,
@@ -141,13 +121,22 @@ class KafkaQueue extends Queue implements QueueContract
                 $pushRawCorrelationId
             );
 
-            $this->logJobEvent(
-                'JOB_CREATED',
-                [
-                    'job_id' => $pushRawCorrelationId,
-                    'queue' => $queueName,
-                ]
-            );
+            /*
+             * JOB_CREATED is only stored for the initial enqueue.
+             *
+             * Retries use:
+             *     'log_created' => false
+             */
+            if (
+                !isset($options['log_created']) ||
+                $options['log_created'] === true
+            ) {
+                $this->storeJobCreated(
+                    $pushRawCorrelationId,
+                    $payloadData,
+                    $queue
+                );
+            }
 
             return $pushRawCorrelationId;
         } catch (ErrorException $exception) {
@@ -156,16 +145,49 @@ class KafkaQueue extends Queue implements QueueContract
     }
 
     /**
-     * Push a new job onto the queue after a delay.
-     *
-     * @param \DateTime|int $delay
-     * @param string $job
-     * @param mixed $data
-     * @param string $queue
-     *
-     * @throws QueueKafkaException
-     *
-     * @return mixed
+     * Store JOB_CREATED in MongoDB.
+     */
+    protected function storeJobCreated($jobId, $payload, $queue)
+    {
+        try {
+            $jobName = isset($payload['job'])
+                ? $payload['job']
+                : null;
+
+            $method = null;
+
+            if ($jobName) {
+                try {
+                    list($jobClass, $jobMethod) = JobName::parse($jobName);
+
+                    $jobName = $jobClass;
+                    $method = $jobMethod;
+                } catch (Exception $exception) {
+                    // Keep original job name if it cannot be parsed.
+                }
+            }
+
+            $this->getJobLogger()->created(
+                $jobId,
+                [
+                    'job_name' => $jobName,
+                    'method' => $method,
+                    'queue' => $this->getQueueName($queue),
+                    'connection' => isset($this->connectionName)
+                        ? $this->connectionName
+                        : null,
+                ]
+            );
+        } catch (Exception $exception) {
+            Log::error(
+                'Unable to store Kafka JOB_CREATED event: ' .
+                $exception->getMessage()
+            );
+        }
+    }
+
+    /**
+     * Process delayed job.
      */
     public function later($delay, $job, $data = '', $queue = null)
     {
@@ -173,13 +195,7 @@ class KafkaQueue extends Queue implements QueueContract
     }
 
     /**
-     * Pop the next job off of the queue.
-     *
-     * @param string|null $queue
-     *
-     * @throws QueueKafkaException
-     *
-     * @return \Illuminate\Queue\Jobs\Job|null
+     * Get the next Kafka job.
      */
     public function pop($queue = null)
     {
@@ -222,13 +238,13 @@ class KafkaQueue extends Queue implements QueueContract
                         $this,
                         $message,
                         $this->connectionName,
-                        $queue ?: $this->defaultQueue,
+                        $queue,
                         $this->topics[$queue]
                     );
 
                 case RD_KAFKA_RESP_ERR__PARTITION_EOF:
                 case RD_KAFKA_RESP_ERR__TIMED_OUT:
-                    break;
+                    return null;
 
                 default:
                     throw new QueueKafkaException(
@@ -245,25 +261,11 @@ class KafkaQueue extends Queue implements QueueContract
         }
     }
 
-    /**
-     * Get queue name.
-     *
-     * @param string|null $queue
-     *
-     * @return string
-     */
     private function getQueueName($queue)
     {
         return $queue ?: $this->defaultQueue;
     }
 
-    /**
-     * Return a Kafka Topic based on the name.
-     *
-     * @param string $queue
-     *
-     * @return \RdKafka\ProducerTopic
-     */
     private function getTopic($queue)
     {
         return $this->producer->newTopic(
@@ -271,49 +273,36 @@ class KafkaQueue extends Queue implements QueueContract
         );
     }
 
-    /**
-     * Sets the correlation id for a message to be published.
-     *
-     * @param string $id
-     */
     public function setCorrelationId($id)
     {
         $this->correlationId = $id;
     }
 
-    /**
-     * Retrieves the correlation id, or a unique id.
-     *
-     * @return string
-     */
     public function getCorrelationId()
     {
-        return $this->correlationId ?: uniqid('', true);
+        if (!$this->correlationId) {
+            $this->correlationId = uniqid('', true);
+        }
+
+        return $this->correlationId;
     }
 
-    /**
-     * Get Kafka configuration.
-     *
-     * @return array
-     */
     public function getConfig()
     {
         return $this->config;
     }
 
-    /**
-     * Create a payload array from the given job and data.
-     *
-     * @param string $job
-     * @param string $queue
-     * @param mixed $data
-     *
-     * @return array
-     */
-    protected function createPayloadArray($job, $queue = null, $data = '')
-    {
+    protected function createPayloadArray(
+        $job,
+        $queue = null,
+        $data = ''
+    ) {
         return array_merge(
-            parent::createPayloadArray($job, $queue, $data),
+            parent::createPayloadArray(
+                $job,
+                $queue,
+                $data
+            ),
             [
                 'id' => $this->getCorrelationId(),
                 'attempts' => 0,
@@ -321,52 +310,13 @@ class KafkaQueue extends Queue implements QueueContract
         );
     }
 
-    /**
-     * Write a custom job lifecycle log.
-     *
-     * @param string $event
-     * @param array $context
-     *
-     * @return void
-     */
-    public function logJobEvent($event, array $context = [])
-    {
-        $context = array_merge(
-            [
-                'event' => $event,
-                'driver' => 'kafka',
-                'timestamp' => date('Y-m-d H:i:s'),
-            ],
-            $context
-        );
-
-        switch ($event) {
-            case 'JOB_FAILED':
-                Log::error($event, $context);
-                break;
-
-            case 'JOB_RETRYING':
-                Log::warning($event, $context);
-                break;
-
-            default:
-                Log::info($event, $context);
-                break;
-        }
-    }
-
-    /**
-     * Report Kafka connection error.
-     *
-     * @param string $action
-     * @param Exception $e
-     *
-     * @throws QueueKafkaException
-     */
     protected function reportConnectionError($action, Exception $e)
     {
         Log::error(
-            'Kafka error while attempting ' . $action . ': ' . $e->getMessage()
+            'Kafka error while attempting ' .
+            $action .
+            ': ' .
+            $e->getMessage()
         );
 
         if ($this->sleepOnError === false) {
@@ -378,11 +328,18 @@ class KafkaQueue extends Queue implements QueueContract
         sleep($this->sleepOnError);
     }
 
-    /**
-     * @return \RdKafka\Consumer
-     */
     public function getConsumer()
     {
         return $this->consumer;
+    }
+
+    /**
+     * Get MongoDB Kafka job logger.
+     */
+    protected function getJobLogger()
+    {
+        return $this->container->make(
+            KafkaJobLogger::class
+        );
     }
 }
