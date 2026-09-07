@@ -32,7 +32,7 @@ class KafkaQueue extends Queue implements QueueContract
 
     public function __construct(
         \RdKafka\Producer $producer,
-        \RdKafka\Consumer $consumer,
+        \RdKafka\KafkaConsumer $consumer,
         $config
     ) {
         $this->defaultQueue = $config['queue'];
