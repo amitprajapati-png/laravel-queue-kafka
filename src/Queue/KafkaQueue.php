@@ -145,16 +145,18 @@ class KafkaQueue extends Queue implements QueueContract
     }
 
     /**
-     * Store JOB_CREATED in MongoDB.
+     * Store initial job information in MongoDB.
+     *
+     * One MongoDB document is maintained for the complete
+     * lifecycle of the logical job.
      */
     protected function storeJobCreated($jobId, $payload, $queue)
     {
         try {
             $jobName = null;
-            $method = null;
-    
+
             /*
-             * Laravel stores the actual job class here.
+             * Laravel stores the actual dispatched job class here.
              *
              * Example:
              * App\Jobs\LoginHistoryJob
@@ -164,13 +166,8 @@ class KafkaQueue extends Queue implements QueueContract
                 !empty($payload['data']['commandName'])
             ) {
                 $jobName = $payload['data']['commandName'];
-    
-                /*
-                 * Laravel's queued job normally executes handle().
-                 */
-                $method = 'handle';
             }
-    
+
             /*
              * Fallback for non-command jobs.
              */
@@ -183,12 +180,25 @@ class KafkaQueue extends Queue implements QueueContract
                     $jobName = $payload['job'];
                 }
             }
-    
+
+            /*
+             * The actual serialized Laravel job is stored inside:
+             *
+             *     data.command
+             *
+             * Example:
+             *
+             * O:24:"App\Jobs\LoginHistoryJob":...
+             */
+            $serializedPayload = isset($payload['data']['command'])
+                ? $payload['data']['command']
+                : null;
+
             $this->getJobLogger()->created(
                 $jobId,
                 [
-                    'job_name' => $jobName,
-                    'method' => $method,
+                    'class_name' => $jobName,
+                    'payload' => $serializedPayload,
                     'queue' => $this->getQueueName($queue),
                     'connection' => isset($this->connectionName)
                         ? $this->connectionName
