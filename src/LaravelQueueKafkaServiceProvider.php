@@ -104,7 +104,7 @@ class LaravelQueueKafkaServiceProvider extends ServiceProvider
         $this->app->bind(
             'queue.kafka.consumer',
             function ($app, $parameters) {
-                return new \RdKafka\Consumer(
+                return new \RdKafka\KafkaConsumer(
                     $parameters['conf']
                 );
             }
