@@ -77,70 +77,116 @@ class KafkaQueue extends Queue implements QueueContract
      */
     public function pushRaw($payload, $queue = null, array $options = [])
     {
+        $jobId = null;
+    
         try {
             $topicName = $this->getQueueName($queue);
-
-            /*
-             * Decode payload so that we can get the logical job ID.
-             */
+    
             $payloadData = json_decode($payload, true);
-
+    
+            /*
+             * Existing ID = retry.
+             * Missing ID = new job.
+             */
             if (
                 is_array($payloadData) &&
                 isset($payloadData['id']) &&
                 $payloadData['id']
             ) {
-                $pushRawCorrelationId = $payloadData['id'];
-
+                $jobId = $payloadData['id'];
+    
                 /*
-                 * Keep the same logical job ID when a job is retried.
+                 * Preserve the original ID for retry.
                  */
-                $this->correlationId = $pushRawCorrelationId;
+                $this->correlationId = $jobId;
             } else {
-                $pushRawCorrelationId = $this->getCorrelationId();
-
+                $jobId = $this->getCorrelationId();
+    
                 if (
                     is_array($payloadData) &&
                     !isset($payloadData['id'])
                 ) {
-                    $payloadData['id'] = $pushRawCorrelationId;
-
+                    $payloadData['id'] = $jobId;
                     $payload = json_encode($payloadData);
                 }
             }
-
-            $topic = $this->getTopic($queue);
-
+    
             /*
-             * Send the message to Kafka.
+             * Create lifecycle record only once.
+             *
+             * Retry must NOT create another Mongo document.
+             */
+            $logCreated = !isset($options['log_created'])
+                || $options['log_created'] === true;
+    
+            if ($logCreated) {
+                $this->storeJobCreated(
+                    $jobId,
+                    $payloadData,
+                    $queue
+                );
+            }
+    
+            Log::info('KAFKA PRODUCE START', [
+                'job_id' => $jobId,
+                'topic' => $topicName,
+            ]);
+    
+            $topic = $this->getTopic($queue);
+    
+            /*
+             * Produce asynchronously.
+             *
+             * Do NOT flush here for every job.
              */
             $topic->produce(
                 RD_KAFKA_PARTITION_UA,
                 0,
                 $payload,
-                $pushRawCorrelationId
+                $jobId
             );
-
+    
             /*
-             * JOB_CREATED is only stored for the initial enqueue.
-             *
-             * Retries use:
-             *     'log_created' => false
+             * Let librdkafka process delivery events.
+             */
+            $this->producer->poll(0);
+    
+            Log::info('KAFKA PRODUCE QUEUED', [
+                'job_id' => $jobId,
+                'topic' => $topicName,
+            ]);
+    
+            return $jobId;
+    
+        } catch (\Exception $exception) {
+    
+            Log::error('KAFKA PUSH ERROR', [
+                'job_id' => $jobId,
+                'error' => $exception->getMessage(),
+            ]);
+    
+            /*
+             * If the message could not even be queued into
+             * librdkafka, mark the initial job as failed.
              */
             if (
-                !isset($options['log_created']) ||
-                $options['log_created'] === true
+                $jobId &&
+                (!isset($options['log_created'])
+                    || $options['log_created'] === true)
             ) {
-                $this->storeJobCreated(
-                    $pushRawCorrelationId,
-                    $payloadData,
-                    $queue
+                $this->jobLogger->failed(
+                    $jobId,
+                    [
+                        'attempt' => 0,
+                    ]
                 );
             }
-
-            return $pushRawCorrelationId;
-        } catch (ErrorException $exception) {
-            $this->reportConnectionError('pushRaw', $exception);
+    
+            throw new QueueKafkaException(
+                'Could not push job to Kafka',
+                0,
+                $exception
+            );
         }
     }
 
