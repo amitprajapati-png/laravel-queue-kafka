@@ -29,10 +29,6 @@ class KafkaJob extends Job implements JobContract
 
     /**
      * Number of times this same KafkaJob object has executed.
-     *
-     * This is particularly important for deadlock retries because
-     * deadlock retry happens inside fire() without creating a new
-     * Kafka message.
      */
     protected $executionAttempts = 0;
 
@@ -89,17 +85,12 @@ class KafkaJob extends Job implements JobContract
         );
 
         /*
-         * Store JOB_PROCESSING.
+         * Store status = processing.
          */
         $this->jobLogger->processing(
             $this->getJobId(),
             [
-                'job_name' => $this->getJobNameFromPayload($payload),
-                'queue' => $this->getQueue(),
-                'connection' => $this->connectionName,
                 'attempt' => $attempt,
-                'partition' => $this->message->partition,
-                'offset' => $this->message->offset,
             ]
         );
 
@@ -127,17 +118,12 @@ class KafkaJob extends Job implements JobContract
             }
 
             /*
-             * Job code completed successfully.
+             * Job completed successfully.
              */
             $this->jobLogger->completed(
                 $this->getJobId(),
                 [
-                    'job_name' => $this->getJobNameFromPayload($payload),
-                    'queue' => $this->getQueue(),
-                    'connection' => $this->connectionName,
                     'attempt' => $attempt,
-                    'partition' => $this->message->partition,
-                    'offset' => $this->message->offset,
                 ]
             );
         } catch (Exception $exception) {
@@ -159,12 +145,7 @@ class KafkaJob extends Job implements JobContract
                 $this->jobLogger->retrying(
                     $this->getJobId(),
                     [
-                        'job_name' => $this->getJobNameFromPayload($payload),
-                        'queue' => $this->getQueue(),
-                        'connection' => $this->connectionName,
                         'attempt' => $attempt,
-                        'reason' => 'deadlock',
-                        'error' => $exception->getMessage(),
                     ]
                 );
 
@@ -179,10 +160,10 @@ class KafkaJob extends Job implements JobContract
             }
 
             /*
-             * Do NOT store JOB_FAILED here.
+             * Laravel may retry the job.
              *
-             * Laravel may retry the job. The final JOB_FAILED event
-             * is recorded by the Laravel JobFailed event listener.
+             * Final JOB_FAILED is recorded by the Laravel
+             * JobFailed event listener.
              */
             throw $exception;
         }
@@ -242,8 +223,6 @@ class KafkaJob extends Job implements JobContract
     {
         /*
          * Delayed jobs are still unsupported by this driver.
-         *
-         * Do this check BEFORE deleting the current Kafka message.
          */
         if ($delay > 0) {
             throw new QueueKafkaException(
@@ -264,49 +243,26 @@ class KafkaJob extends Job implements JobContract
         );
 
         /*
-         * Determine why this job is being released.
-         */
-        $reason = 'job_released';
-
-        $retryData = [
-            'job_name' => $this->getJobNameFromPayload($body),
-            'queue' => $this->getQueue(),
-            'connection' => $this->connectionName,
-            'attempt' => $attempt,
-            'reason' => $reason,
-        ];
-
-        if ($this->lastException instanceof Exception) {
-            $reason = 'exception_retry';
-
-            $retryData['reason'] = $reason;
-            $retryData['error'] = $this->lastException->getMessage();
-            $retryData['exception'] = get_class(
-                $this->lastException
-            );
-        }
-
-        /*
-         * Store JOB_RETRYING before putting the next message.
+         * Store retry status.
          */
         $this->jobLogger->retrying(
             $this->getJobId(),
-            $retryData
+            [
+                'attempt' => $attempt,
+            ]
         );
 
         /*
-         * Increment attempts in the Kafka payload.
+         * Increment attempts in Kafka payload.
          *
-         * Original:
+         * First execution:
          *
-         *     attempts = 0
+         *     attempts = 0 in payload
+         *     attempts() = 1
          *
          * First retry:
          *
-         *     attempts = 1
-         *
-         * Next processing:
-         *
+         *     attempts = 1 in payload
          *     attempts() = 2
          */
         $body['attempts'] = $attempt;
@@ -316,11 +272,7 @@ class KafkaJob extends Job implements JobContract
         /*
          * Produce the retry message FIRST.
          *
-         * This is preferable to deleting the old message first because
-         * a Kafka produce failure should not cause job loss.
-         *
-         * The same ID is retained, so MongoDB continues tracking the
-         * same logical job.
+         * Same job ID is retained.
          */
         $this->connection->pushRaw(
             $payload,
@@ -358,6 +310,7 @@ class KafkaJob extends Job implements JobContract
             ? $payload['id']
             : null;
     }
+
     /**
      * Get Kafka message.
      */
@@ -379,39 +332,30 @@ class KafkaJob extends Job implements JobContract
      */
     protected function getJobNameFromPayload(array $payload)
     {
-        /*
-         * Laravel provides the actual dispatched job class
-         * in data.commandName.
-         */
         if (
             isset($payload['data']['commandName']) &&
             !empty($payload['data']['commandName'])
         ) {
             return $payload['data']['commandName'];
         }
-    
-        /*
-         * Fallback for other types of queue payloads.
-         */
+
         if (isset($payload['job'])) {
             try {
                 list($class, $method) = JobName::parse(
                     $payload['job']
                 );
-    
+
                 return $class;
             } catch (Exception $exception) {
                 return $payload['job'];
             }
         }
-    
+
         return null;
     }
 
     /**
      * Unserialize command.
-     *
-     * Kept for compatibility with the existing driver.
      */
     private function unserialize(array $body)
     {
