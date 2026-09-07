@@ -65,7 +65,7 @@ class KafkaConnector implements ConnectorInterface
 
         $consumerConf->set('bootstrap.servers', $config['brokers']);
         $consumerConf->set('enable.auto.commit', 'false');
-        $consumerConf->set('auto.offset.reset', 'latest');
+        $consumerConf->set('auto.offset.reset', 'earliest');
         $consumerConf->set(
             'security.protocol',
             $config['security_protocol']
