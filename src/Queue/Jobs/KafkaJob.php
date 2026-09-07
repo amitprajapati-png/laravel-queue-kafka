@@ -12,7 +12,6 @@ use Illuminate\Support\Str;
 use Rapide\LaravelQueueKafka\Exceptions\QueueKafkaException;
 use Rapide\LaravelQueueKafka\Queue\KafkaQueue;
 use App\Services\KafkaJobLogger;
-use RdKafka\ConsumerTopic;
 use RdKafka\Message;
 
 class KafkaJob extends Job implements JobContract
@@ -25,7 +24,7 @@ class KafkaJob extends Job implements JobContract
 
     protected $message;
 
-    protected $topic;
+    protected $consumer;
 
     /**
      * Number of times this same KafkaJob object has executed.
@@ -43,25 +42,20 @@ class KafkaJob extends Job implements JobContract
     protected $jobLogger;
 
     public function __construct(
-        Container $container,
-        KafkaQueue $connection,
-        Message $message,
-        $connectionName,
-        $queue,
-        ConsumerTopic $topic
+    Container $container,
+    KafkaQueue $connection,
+    Message $message,
+    $connectionName,
+    $queue,
+    \RdKafka\KafkaConsumer $consumer
     ) {
         $this->container = $container;
-
         $this->connection = $connection;
-
         $this->message = $message;
-
         $this->connectionName = $connectionName;
-
         $this->queue = $queue;
-
-        $this->topic = $topic;
-
+        $this->consumer = $consumer;
+    
         $this->jobLogger = $container->make(
             KafkaJobLogger::class
         );
@@ -198,14 +192,9 @@ class KafkaJob extends Job implements JobContract
     {
         try {
             parent::delete();
-
-            /*
-             * Store Kafka offset only after Laravel considers the
-             * message successfully deleted.
-             */
-            $this->topic->offsetStore(
-                $this->message->partition,
-                $this->message->offset
+    
+            $this->consumer->commit(
+                $this->message
             );
         } catch (\RdKafka\Exception $exception) {
             throw new QueueKafkaException(
