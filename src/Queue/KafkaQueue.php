@@ -228,58 +228,78 @@ class KafkaQueue extends Queue implements QueueContract
     {
         try {
             $queue = $this->getQueueName($queue);
-
-            if (!array_key_exists($queue, $this->queues)) {
-                $this->queues[$queue] = $this->consumer->newQueue();
-
-                $topicConf = new \RdKafka\TopicConf();
-
-                $topicConf->set(
-                    'auto.offset.reset',
-                    'largest'
-                );
-
-                $this->topics[$queue] = $this->consumer->newTopic(
-                    $queue,
-                    $topicConf
-                );
-
-                $this->topics[$queue]->consumeQueueStart(
-                    0,
-                    RD_KAFKA_OFFSET_STORED,
-                    $this->queues[$queue]
-                );
+    
+            Log::info('KAFKA POP START', [
+                'queue' => $queue,
+            ]);
+    
+            if (!isset($this->queues[$queue])) {
+    
+                Log::info('KAFKA SUBSCRIBE START', [
+                    'queue' => $queue,
+                ]);
+    
+                $this->consumer->subscribe([$queue]);
+    
+                $this->queues[$queue] = true;
+    
+                Log::info('KAFKA SUBSCRIBE SUCCESS', [
+                    'queue' => $queue,
+                ]);
             }
-
-            $message = $this->queues[$queue]->consume(1000);
-
+    
+            Log::info('KAFKA CONSUME START');
+    
+            $message = $this->consumer->consume(1000);
+    
+            Log::info('KAFKA CONSUME RETURNED', [
+                'error' => $message ? $message->err : null,
+                'error_string' => $message ? $message->errstr() : null,
+                'partition' => $message ? $message->partition : null,
+                'offset' => $message ? $message->offset : null,
+            ]);
+    
             if ($message === null) {
                 return null;
             }
-
+    
             switch ($message->err) {
+    
                 case RD_KAFKA_RESP_ERR_NO_ERROR:
-
+    
+                    Log::info('KAFKA MESSAGE RECEIVED', [
+                        'partition' => $message->partition,
+                        'offset' => $message->offset,
+                    ]);
+    
                     return new KafkaJob(
                         $this->container,
                         $this,
                         $message,
                         $this->connectionName,
                         $queue,
-                        $this->topics[$queue]
+                        $this->consumer
                     );
-
+    
                 case RD_KAFKA_RESP_ERR__PARTITION_EOF:
                 case RD_KAFKA_RESP_ERR__TIMED_OUT:
+    
                     return null;
-
+    
                 default:
+    
                     throw new QueueKafkaException(
                         $message->errstr(),
                         $message->err
                     );
             }
+    
         } catch (\RdKafka\Exception $exception) {
+    
+            Log::error('KAFKA POP EXCEPTION', [
+                'message' => $exception->getMessage(),
+            ]);
+    
             throw new QueueKafkaException(
                 'Could not pop from the queue',
                 0,
