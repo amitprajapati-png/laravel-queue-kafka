@@ -275,35 +275,17 @@ class KafkaQueue extends Queue implements QueueContract
         try {
             $queue = $this->getQueueName($queue);
     
-            Log::info('KAFKA POP START', [
-                'queue' => $queue,
-            ]);
-    
             if (!isset($this->queues[$queue])) {
-    
-                Log::info('KAFKA SUBSCRIBE START', [
-                    'queue' => $queue,
-                ]);
-    
                 $this->consumer->subscribe([$queue]);
-    
                 $this->queues[$queue] = true;
-    
-                Log::info('KAFKA SUBSCRIBE SUCCESS', [
-                    'queue' => $queue,
-                ]);
             }
     
-            Log::info('KAFKA CONSUME START');
-    
-            $message = $this->consumer->consume(1000);
-    
-            Log::info('KAFKA CONSUME RETURNED', [
-                'error' => $message ? $message->err : null,
-                'error_string' => $message ? $message->errstr() : null,
-                'partition' => $message ? $message->partition : null,
-                'offset' => $message ? $message->offset : null,
-            ]);
+            /*
+             * Wait for Kafka message.
+             *
+             * 5000 ms is preferable to repeatedly polling every 1 second.
+             */
+            $message = $this->consumer->consume(5000);
     
             if ($message === null) {
                 return null;
@@ -314,8 +296,10 @@ class KafkaQueue extends Queue implements QueueContract
                 case RD_KAFKA_RESP_ERR_NO_ERROR:
     
                     Log::info('KAFKA MESSAGE RECEIVED', [
+                        'topic' => $message->topic_name,
                         'partition' => $message->partition,
                         'offset' => $message->offset,
+                        'key' => $message->key,
                     ]);
     
                     return new KafkaJob(
@@ -328,8 +312,21 @@ class KafkaQueue extends Queue implements QueueContract
                     );
     
                 case RD_KAFKA_RESP_ERR__PARTITION_EOF:
+    
+                    /*
+                     * No more messages currently available
+                     * in this partition.
+                     */
+                    return null;
+    
                 case RD_KAFKA_RESP_ERR__TIMED_OUT:
     
+                    /*
+                     * This is NOT an error.
+                     *
+                     * It simply means no message arrived during
+                     * the consume timeout.
+                     */
                     return null;
     
                 default:
@@ -341,10 +338,6 @@ class KafkaQueue extends Queue implements QueueContract
             }
     
         } catch (\RdKafka\Exception $exception) {
-    
-            Log::error('KAFKA POP EXCEPTION', [
-                'message' => $exception->getMessage(),
-            ]);
     
             throw new QueueKafkaException(
                 'Could not pop from the queue',
