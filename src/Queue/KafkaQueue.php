@@ -149,7 +149,21 @@ class KafkaQueue extends Queue implements QueueContract
             /*
              * Let librdkafka process delivery events.
              */
-            $this->producer->poll(0);
+            $flushResult = $this->producer->flush(5000);
+            if ($flushResult !== RD_KAFKA_RESP_ERR_NO_ERROR) {
+
+                Log::error('KAFKA PRODUCE FAILED', [
+                    'job_id' => $jobId,
+                    'topic' => $topicName,
+                    'error_code' => $flushResult,
+                    'error' => rd_kafka_err2str($flushResult),
+                ]);
+            
+                throw new QueueKafkaException(
+                    'Kafka message delivery failed: ' .
+                    rd_kafka_err2str($flushResult)
+                );
+            }
     
             Log::info('KAFKA PRODUCE QUEUED', [
                 'job_id' => $jobId,
